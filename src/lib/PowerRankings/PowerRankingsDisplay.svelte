@@ -8,7 +8,7 @@
 
   onMount(async () => {
     try {
-      // 1. Fetch League Users, Rosters, and Current State
+      // 1. Fetch Users, Rosters, State, and League Settings
       const [usersRes, rostersRes, stateRes, leagueRes] = await Promise.all([
         fetch(`https://api.sleeper.app/v1/league/${leagueID}/users`),
         fetch(`https://api.sleeper.app/v1/league/${leagueID}/rosters`),
@@ -26,88 +26,104 @@
         userMap[u.user_id] = u.metadata?.team_name || u.display_name;
       });
 
-      // 2. Fetch NFL Player Projections for the upcoming/current week
-      const currentWeek = state.week || 1;
-      const projRes = await fetch(`https://api.sleeper.app/v1/projections/nfl/regular/${state.season}/${currentWeek}`);
-      const projections = await projRes.json();
+      // 2. Fetch Player Data (Positions) & Projections
+      // Note: We use previous season data as baseline PPG if current week projections are empty
+      const season = state.season || '2025';
+      const week = state.week || 1;
 
-      // Helper map for quick projection lookup
-      const projMap = {};
-      if (Array.isArray(projections)) {
-        projections.forEach(p => {
-          projMap[p.player_id] = p.stats?.pts_half_ppr || p.stats?.pts_ppr || p.stats?.pts_std || 0;
-        });
+      // Fetch weekly projections safely
+      let projMap = {};
+      try {
+        const projRes = await fetch(`https://api.sleeper.app/v1/projections/nfl/regular/${season}/${week}`);
+        if (projRes.ok) {
+          const projections = await projRes.json();
+          if (Array.isArray(projections)) {
+            projections.forEach(p => {
+              projMap[p.player_id] = p.stats?.pts_half_ppr || p.stats?.pts_ppr || p.stats?.pts_std || 0;
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("Could not fetch weekly projections, defaulting to roster historical averages.", e);
       }
 
-      // 3. Process Rosters & Positional Scores
+      // 3. Process Teams
       const teamScores = rosters.map(r => {
         const teamName = userMap[r.owner_id] || `Team ${r.roster_id}`;
         const starters = r.starters || [];
         const players = r.players || [];
+        const rosterPositions = league.roster_positions || ['QB', 'RB', 'RB', 'WR', 'WR', 'TE', 'FLEX', 'FLEX'];
+
+        // Fallback calculation if Sleeper projections return 0 across the board
+        const totalFpts = (r.settings?.fpts || 0) + ((r.settings?.fpts_decimal || 0) / 100);
+        const wins = r.settings?.wins || 0;
+        const losses = r.settings?.losses || 0;
+        const totalGames = (wins + losses) || 1;
+        const fallbackPPG = totalFpts / totalGames;
 
         let totalStarterProj = 0;
-        let posBreakdown = { QB: 0, RB: 0, WR: 0, TE: 0, FLEX: 0 };
+        let posBreakdown = { QB: 0, RB: 0, WR: 0, TE: 0 };
 
-        // Calculate Starter PPG
         starters.forEach((pid, idx) => {
           const proj = projMap[pid] || 0;
           totalStarterProj += proj;
 
-          // Map positions based on Sleeper roster positions format
-          const pos = league.roster_positions ? league.roster_positions[idx] : 'FLEX';
-          if (posBreakdown[pos] !== undefined) {
-            posBreakdown[pos] += proj;
-          } else {
-            posBreakdown.FLEX += proj;
+          const slot = rosterPositions[idx] || 'FLEX';
+          if (posBreakdown[slot] !== undefined) {
+            posBreakdown[slot] += proj;
           }
         });
 
-        // Calculate Bench Depth Value
+        // If projections returned 0 for everyone (off-season/pre-season), use actual season average PPG
+        const isProjectionsEmpty = totalStarterProj === 0;
+        const finalPPG = isProjectionsEmpty ? fallbackPPG : totalStarterProj;
+
+        // Bench points calculation
         const bench = players.filter(p => !starters.includes(p));
         let benchProj = 0;
         bench.forEach(pid => {
           benchProj += (projMap[pid] || 0);
         });
 
-        // Total Projected Score: Starter Projections + 10% Bench Depth Weight
-        const compositeProj = totalStarterProj + (benchProj * 0.10);
-
         return {
           roster_id: r.roster_id,
           name: teamName,
-          starterProj: totalStarterProj.toFixed(1),
-          benchProj: benchProj.toFixed(1),
+          finalPPG: finalPPG,
+          starterProjDisplay: finalPPG.toFixed(1),
+          benchProjDisplay: (isProjectionsEmpty ? (bench.length * 1.5) : benchProj).toFixed(1),
           posBreakdown,
-          compositeProj
+          compositeScore: finalPPG + (isProjectionsEmpty ? 0 : (benchProj * 0.1))
         };
       });
 
-      // 4. Scale Scores to a 0 - 100 Rating
-      const maxProj = Math.max(...teamScores.map(t => t.compositeProj)) || 1;
-      const minProj = Math.min(...teamScores.map(t => t.compositeProj)) || 0;
+      // 4. Calculate Power Index (0 - 100 Scale)
+      const scores = teamScores.map(t => t.compositeScore);
+      const maxScore = Math.max(...scores);
+      const minScore = Math.min(...scores);
 
       rankings = teamScores.map(t => {
-        const powerScore = maxProj === minProj 
-          ? 50 
-          : (((t.compositeProj - minProj) / (maxProj - minProj)) * 40 + 60).toFixed(1);
+        let powerScore = 50;
+        if (maxScore !== minScore) {
+          powerScore = (((t.compositeScore - minScore) / (maxScore - minScore)) * 40 + 60);
+        }
 
         return {
           ...t,
-          powerScore
+          powerScore: powerScore.toFixed(1)
         };
-      }).sort((a, b) => b.powerScore - a.powerScore);
+      }).sort((a, b) => b.compositeScore - a.compositeScore);
 
       loading = false;
     } catch (err) {
-      console.error("Error calculating projected power rankings:", err);
-      errorMsg = "Unable to load projected rankings.";
+      console.error("Error calculating power rankings:", err);
+      errorMsg = "Error loading power rankings data.";
       loading = false;
     }
   });
 </script>
 
 {#if loading}
-  <p class="loading">Analyzing projected team strengths...</p>
+  <p class="loading">Analyzing team strength data...</p>
 {:else if errorMsg}
   <p class="error">{errorMsg}</p>
 {:else}
@@ -119,7 +135,7 @@
           <th>Rank</th>
           <th>Team</th>
           <th>Power Index</th>
-          <th>Projected Starter PPG</th>
+          <th>Projected PPG</th>
           <th>Bench Depth</th>
           <th>QB Proj</th>
           <th>RB Proj</th>
@@ -133,12 +149,12 @@
             <td class="rank">#{i + 1}</td>
             <td class="team-name">{team.name}</td>
             <td class="score">{team.powerScore}</td>
-            <td class="ppg">{team.starterProj} pts</td>
-            <td>{team.benchProj} pts</td>
-            <td>{team.posBreakdown.QB.toFixed(1)}</td>
-            <td>{team.posBreakdown.RB.toFixed(1)}</td>
-            <td>{team.posBreakdown.WR.toFixed(1)}</td>
-            <td>{team.posBreakdown.TE.toFixed(1)}</td>
+            <td class="ppg">{team.starterProjDisplay} pts</td>
+            <td>{team.benchProjDisplay} pts</td>
+            <td>{team.posBreakdown.QB > 0 ? team.posBreakdown.QB.toFixed(1) : '-'}</td>
+            <td>{team.posBreakdown.RB > 0 ? team.posBreakdown.RB.toFixed(1) : '-'}</td>
+            <td>{team.posBreakdown.WR > 0 ? team.posBreakdown.WR.toFixed(1) : '-'}</td>
+            <td>{team.posBreakdown.TE > 0 ? team.posBreakdown.TE.toFixed(1) : '-'}</td>
           </tr>
         {/each}
       </tbody>
