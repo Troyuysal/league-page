@@ -1,107 +1,142 @@
 <script>
-	import BarChart from '$lib/BarChart.svelte';
-    import { generateGraph, getTeamFromTeamManagers, round, predictScores, loadPlayers } from '$lib/utils/helper';
-    export let nflState, rostersData, leagueTeamManagers, playersInfo, leagueData;
+  import { onMount } from 'svelte';
+  import { leagueID } from '$lib/utils/leagueInfo';
 
-    const rosters = rostersData.rosters;
+  let rankings = [];
+  let loading = true;
 
-    let validGraph = false;
+  onMount(async () => {
+    try {
+      // 1. Fetch Users, Rosters, and League State
+      const [usersRes, rostersRes, stateRes] = await Promise.all([
+        fetch(`https://api.sleeper.app/v1/league/${leagueID}/users`),
+        fetch(`https://api.sleeper.app/v1/league/${leagueID}/rosters`),
+        fetch(`https://api.sleeper.app/v1/state/nfl`)
+      ]);
 
-    let graphs = [];
+      const users = await usersRes.json();
+      const rosters = await rostersRes.json();
+      const state = await stateRes.json();
 
-    let seasonOver = false;
+      const userMap = {};
+      users.forEach(u => {
+        userMap[u.user_id] = u.metadata?.team_name || u.display_name;
+      });
 
-    const buildRankings = () => {
-        const rosterPowers = [];
-        let week = nflState.week;
-        if(week == 0) {
-            week = 1;
-        }
-        let max = 0;
+      const currentWeek = state.display_week > 1 ? state.display_week - 1 : 1;
 
-        for(const rosterID in rosters) {
-            const roster = rosters[rosterID];
-            // make sure the roster has players on it
-            if(!roster.players) continue;
-            // if at least one team has players, create the graph
-            validGraph = true;
-
-            const rosterPlayers = [];
-
-            for(const rosterPlayer of roster.players) {
-                if(!players[rosterPlayer]) contnue;
-                rosterPlayers.push({
-                    name: players[rosterPlayer].ln,
-                    pos: players[rosterPlayer].pos,
-                    wi: players[rosterPlayer].wi
-                })
-            }
-
-            const rosterPower = {
-                rosterID,
-                manager: getTeamFromTeamManagers(leagueTeamManagers, rosterID),
-                powerScore: 0,
-            }
-            const seasonEnd = 18;
-            if(week >= seasonEnd) {
-                seasonOver = true;
-            }
-            for(let i = week; i < seasonEnd; i++) {
-                rosterPower.powerScore += predictScores(rosterPlayers, i, leagueData);
-            }
-            if(rosterPower.powerScore > max) {
-                max = rosterPower.powerScore;
-            }
-            rosterPowers.push(rosterPower);
-        }
-
-        for(const rosterPower of rosterPowers) {
-            rosterPower.powerScore = round(rosterPower.powerScore/max * 100);
-        }
-
-        const powerGraph = {
-            stats: rosterPowers,
-            x: "Manager",
-            y: "Power Ranking",
-            stat: "",
-            header: "Rest of Season Power Rankings",
-            field: "powerScore",
-            short: "ROS Power Ranking"
+      // 2. Initialize Teams
+      const teams = {};
+      rosters.forEach(r => {
+        teams[r.roster_id] = {
+          roster_id: r.roster_id,
+          name: userMap[r.owner_id] || `Team ${r.roster_id}`,
+          wins: r.settings.wins || 0,
+          losses: r.settings.losses || 0,
+          fpts: (r.settings.fpts || 0) + ((r.settings.fpts_decimal || 0) / 100),
+          allPlayWins: 0,
+          allPlayLosses: 0
         };
+      });
 
-        graphs = [
-            generateGraph(powerGraph, leagueData.season),
-        ]
+      // 3. Fetch Matchups up to Current Week for All-Play Record
+      const matchupPromises = [];
+      for (let w = 1; w <= currentWeek; w++) {
+        matchupPromises.push(fetch(`https://api.sleeper.app/v1/league/${leagueID}/matchups/${w}`).then(r => r.json()));
+      }
+      const weeklyMatchups = await Promise.all(matchupPromises);
+
+      weeklyMatchups.forEach(week => {
+        if (!week || !week.length) return;
+        week.forEach(teamA => {
+          if (!teams[teamA.roster_id]) return;
+          week.forEach(teamB => {
+            if (teamA.roster_id === teamB.roster_id) return;
+            if (teamA.points > teamB.points) teams[teamA.roster_id].allPlayWins++;
+            else if (teamA.points < teamB.points) teams[teamA.roster_id].allPlayLosses++;
+          });
+        });
+      });
+
+      // 4. Calculate Scores & Normalize
+      const teamList = Object.values(teams);
+      const maxFpts = Math.max(...teamList.map(t => t.fpts)) || 1;
+      const minFpts = Math.min(...teamList.map(t => t.fpts)) || 0;
+
+      rankings = teamList.map(t => {
+        const winPct = (t.wins + t.losses) > 0 ? t.wins / (t.wins + t.losses) : 0.5;
+        const allPlayPct = (t.allPlayWins + t.allPlayLosses) > 0 ? t.allPlayWins / (t.allPlayWins + t.allPlayLosses) : 0.5;
+        const normFpts = maxFpts === minFpts ? 0.5 : (t.fpts - minFpts) / (maxFpts - minFpts);
+
+        // Score Formula: 40% Wins, 40% Points For, 20% All-Play
+        const score = ((winPct * 0.40) + (normFpts * 0.40) + (allPlayPct * 0.20)) * 100;
+
+        return { ...t, score: score.toFixed(1) };
+      }).sort((a, b) => b.score - a.score);
+
+      loading = false;
+    } catch (err) {
+      console.error("Error loading power rankings:", err);
+      loading = false;
     }
-
-    let players = playersInfo.players;
-
-    buildRankings();
-
-    const refreshPlayers = async () => {
-        const newPlayersInfo = await loadPlayers(null, true);
-        players = newPlayersInfo.players;
-        buildRankings();
-    }
-
-    if(playersInfo.stale) {
-        refreshPlayers();
-    }
-
-    let curGraph = 0;
-
+  });
 </script>
 
-<style>
-    .enclosure {
-        display: block;
-        position: relative;
-        width: 100%;
-    }
-</style>
-
-{#if validGraph && !seasonOver}
-    <div class="enclosure">
-        <BarChart {graphs} bind:curGraph={curGraph} {leagueTeamManagers} />
-    </div>
+{#if loading}
+  <p class="loading">Calculating Power Rankings...</p>
+{:else}
+  <div class="rankings-container">
+    <h3>League Power Rankings</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Rank</th>
+          <th>Team</th>
+          <th>Power Score</th>
+          <th>Record</th>
+          <th>Points For</th>
+          <th>All-Play</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each rankings as team, i}
+          <tr>
+            <td class="rank">#{i + 1}</td>
+            <td class="team-name">{team.name}</td>
+            <td class="score">{team.score}</td>
+            <td>{team.wins}-{team.losses}</td>
+            <td>{team.fpts.toFixed(1)}</td>
+            <td>{team.allPlayWins}-{team.allPlayLosses}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 {/if}
+
+<style>
+  .rankings-container {
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+  }
+  th, td {
+    padding: 10px;
+    border-bottom: 1px solid #333;
+  }
+  .rank {
+    font-weight: bold;
+    color: #00ceb8;
+  }
+  .score {
+    font-weight: bold;
+  }
+  .loading {
+    font-style: italic;
+    color: #888;
+  }
+</style>
